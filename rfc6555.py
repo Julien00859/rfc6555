@@ -43,6 +43,8 @@ def _detect_ipv6():
             _sock.bind(("::1", 0))
             return True
         except _SOCKET_ERRORS:
+            pass
+        finally:
             if _sock:
                 _sock.close()
     return False
