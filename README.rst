@@ -53,7 +53,7 @@ is thread-safe and assign an instance to ``rfc6555.cache``.
   rfc6555.cache.validity_duration = 10  # 10 second validity time.
 
   # Use this to disable caching.
-  rfc6555.cache.enabled = False
+  rfc6555.cache = None
 
 Support
 -------
@@ -68,3 +68,23 @@ License
 The ``rfc6555`` package is released under the ``Apache-2.0`` license.
 
 See `full license text in LICENSE file <https://github.com/sethmlarson/rfc6555/blob/master/LICENSE>`_ for more information.
+
+
+Changelog
+---------
+
+0.2.0
+~~~~~
+
+- Added support for multiple addresses
+- Dropped various ``__version__`` and like metavars, use ``importlib.metadata`` instead
+- Dropped support for Python 2, 3.5, 3.6 and Jython
+- Replaced setup.py/setup.cfg by pyproject.toml
+- Removed ``_RFC6555CacheManager.enabled``, assign ``cache`` to ``None`` to disable the cache
+- Fixed ResourceWarning for unclosed socket in ``_detect_ipv6``
+
+0.1.0
+~~~~~
+
+- Use ``selectors`` instead of ``selectors2`` for Python 3.5+
+- Dropped support for Python 2.6, 3.3, and 3.4

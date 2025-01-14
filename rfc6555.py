@@ -1,4 +1,5 @@
 # Copyright 2021 Seth Michael Larson
+# Copyright 2024 Julien Castiaux
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,79 +13,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Python implementation of the Happy Eyeballs Algorithm described in RFC 6555"""
+"""Python implementation of the Happy Eyeballs Algorithm described in RFC 6555."""
 
+__all__ = ["cache", "create_connection"]
+
+import contextlib
 import errno
 import socket
+from selectors import EVENT_WRITE, DefaultSelector
+from time import perf_counter
 
-try:
-    from selectors import EVENT_WRITE, DefaultSelector
-except (ImportError, AttributeError):
-    from selectors2 import EVENT_WRITE, DefaultSelector
-
-# time.perf_counter() is defined in Python 3.3
-try:
-    from time import perf_counter
-except (ImportError, AttributeError):
-    from time import time as perf_counter
-
-
-# This list is due to socket.error and IOError not being a
-# subclass of OSError until later versions of Python.
-_SOCKET_ERRORS = (socket.error, OSError, IOError)
-
-
-# Detects whether an IPv6 socket can be allocated.
-def _detect_ipv6():
-    if getattr(socket, "has_ipv6", False) and hasattr(socket, "AF_INET6"):
-        _sock = None
-        try:
-            _sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            _sock.bind(("::1", 0))
-            return True
-        except _SOCKET_ERRORS:
-            if _sock:
-                _sock.close()
-    return False
-
-
-_HAS_IPV6 = _detect_ipv6()
+RFC6555_ENABLED = None  # True: always, False: never, None: if host supports ipv6
 
 # These are error numbers for asynchronous operations which can
 # be safely ignored by RFC 6555 as being non-errors.
-_ASYNC_ERRNOS = set([errno.EINPROGRESS, errno.EAGAIN, errno.EWOULDBLOCK])
+_ASYNC_ERRNOS = {errno.EINPROGRESS, errno.EAGAIN, errno.EWOULDBLOCK}
 if hasattr(errno, "WSAWOULDBLOCK"):
     _ASYNC_ERRNOS.add(errno.WSAWOULDBLOCK)
 
 _DEFAULT_CACHE_DURATION = 60 * 10  # 10 minutes according to the RFC.
 
-# This value that can be used to disable RFC 6555 globally.
-RFC6555_ENABLED = _HAS_IPV6
 
-__all__ = ["RFC6555_ENABLED", "create_connection", "cache"]
-
-__version__ = "0.1.0"
-__author__ = "Seth Michael Larson"
-__email__ = "sethmichaellarson@gmail.com"
-__license__ = "Apache-2.0"
-
-
-class _RFC6555CacheManager(object):
+class _RFC6555CacheManager:
     def __init__(self):
         self.validity_duration = _DEFAULT_CACHE_DURATION
-        self.enabled = True
         self.entries = {}
 
     def add_entry(self, address, family):
-        if self.enabled:
-            current_time = perf_counter()
+        current_time = perf_counter()
 
-            # Don't over-write old entries to reset their expiry.
-            if address not in self.entries or self.entries[address][1] > current_time:
-                self.entries[address] = (family, current_time + self.validity_duration)
+        # Don't over-write old entries to reset their expiry.
+        if address not in self.entries or self.entries[address][1] > current_time:
+            self.entries[address] = (family, current_time + self.validity_duration)
 
     def get_entry(self, address):
-        if not self.enabled or address not in self.entries:
+        if address not in self.entries:
             return None
 
         family, expiry = self.entries[address]
@@ -98,11 +61,11 @@ class _RFC6555CacheManager(object):
 cache = _RFC6555CacheManager()
 
 
-class _RFC6555ConnectionManager(object):
+class _RFC6555ConnectionManager:
     def __init__(
-        self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None
+        self, *addresses, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None
     ):
-        self.address = address
+        self.addresses = addresses
         self.timeout = timeout
         self.source_address = source_address
 
@@ -114,49 +77,59 @@ class _RFC6555ConnectionManager(object):
     def create_connection(self):
         self._start_time = perf_counter()
 
-        host, port = self.address
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        addr_info = [
+            info
+            for host, port in self.addresses
+            for info in socket.getaddrinfo(
+                host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+        ]
         ret = self._connect_with_cached_family(addr_info)
 
         # If it's a list, then these are the remaining values to try.
         if isinstance(ret, list):
             addr_info = ret
-        else:
-            cache.add_entry(self.address, ret.family)
+        elif cache is not None:
+            for address in self.addresses:
+                cache.add_entry(address, ret.family)
             return ret
 
         # If we don't get any results back then just skip to the end.
         if not addr_info:
-            raise socket.error("getaddrinfo returns an empty list")
+            e = "getaddrinfo returns an empty list"
+            raise OSError(e)
 
         sock = self._attempt_connect_with_addr_info(addr_info)
 
         if sock:
-            cache.add_entry(self.address, sock.family)
+            if cache is not None:
+                for address in self.addresses:
+                    cache.add_entry(address, sock.family)
             return sock
-        elif self._error:
+        if self._error:
             raise self._error
-        else:
-            raise socket.timeout()
+        raise TimeoutError
 
     def _attempt_connect_with_addr_info(self, addr_info):
         sock = None
         try:
             for family, socktype, proto, _, sockaddr in addr_info:
                 self._create_socket(family, socktype, proto, sockaddr)
-                sock = self._wait_for_connection(False)
+                sock = self._wait_for_connection(last_wait=False)
                 if sock:
                     break
             if sock is None:
-                sock = self._wait_for_connection(True)
+                sock = self._wait_for_connection(last_wait=True)
         finally:
             self._remove_all_sockets()
         return sock
 
     def _connect_with_cached_family(self, addr_info):
-        family = cache.get_entry(self.address)
-        if family is None:
-            return addr_info
+        if cache is not None:
+            for address in self.addresses:
+                family = cache.get_entry(address)
+                if family is None:
+                    return addr_info
 
         is_family = []
         not_family = []
@@ -195,7 +168,7 @@ class _RFC6555ConnectionManager(object):
                 self._selector.register(sock, EVENT_WRITE)
                 self._sockets.append(sock)
 
-        except _SOCKET_ERRORS as e:
+        except OSError as e:
             self._error = e
             if sock is not None:
                 _RFC6555ConnectionManager._close_socket(sock)
@@ -213,13 +186,11 @@ class _RFC6555ConnectionManager(object):
         # then we should wait until we should raise a timeout
         # error, otherwise we should only wait >0.2 seconds as
         # recommended by RFC 6555.
-        if last_wait:
-            if self.timeout is None:
-                select_timeout = None
-            else:
-                select_timeout = self._get_remaining_time()
-        else:
-            select_timeout = self._get_select_time()
+        select_timeout = (
+                 None if self.timeout is None
+            else self._get_remaining_time() if last_wait
+            else self._get_select_time()
+        )
 
         # Wait for any socket to become writable as a sign of being connected.
         for key, _ in self._selector.select(select_timeout):
@@ -248,26 +219,20 @@ class _RFC6555ConnectionManager(object):
         return min(0.2, self._get_remaining_time())
 
     def _remove_all_errored_sockets(self):
-        socks = []
-        for sock in self._sockets:
-            if self._is_socket_errored(sock):
-                socks.append(sock)
-        for sock in socks:
+        for sock in list(filter(self._is_socket_errored, self._sockets)):
             self._selector.unregister(sock)
             self._sockets.remove(sock)
             _RFC6555ConnectionManager._close_socket(sock)
 
     @staticmethod
     def _close_socket(sock):
-        try:
+        with contextlib.suppress(OSError):
             sock.close()
-        except _SOCKET_ERRORS:
-            pass
 
     def _is_acceptable_errno(self, errno):
         if errno == 0 or errno in _ASYNC_ERRNOS:
             return True
-        self._error = socket.error()
+        self._error = OSError()
         self._error.errno = errno
         return False
 
@@ -283,37 +248,31 @@ class _RFC6555ConnectionManager(object):
 
 
 def create_connection(
-    address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None
+    *addresses, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None
 ):
-    if RFC6555_ENABLED and _HAS_IPV6:
-        manager = _RFC6555ConnectionManager(address, timeout, source_address)
+    global RFC6555_ENABLED  # noqa: PLW0603
+    if RFC6555_ENABLED is None:
+        RFC6555_ENABLED = _detect_ipv6()
+    if RFC6555_ENABLED:
+        manager = _RFC6555ConnectionManager(
+            *addresses,
+            timeout=timeout,
+            source_address=source_address
+        )
         return manager.create_connection()
-    else:
-        # This code is the same as socket.create_connection() but is
-        # here to make sure the same code is used across all Python versions as
-        # the source_address parameter was added to socket.create_connection() in 3.2
-        # This segment of code is licensed under the Python Software Foundation License
-        # See LICENSE: https://github.com/python/cpython/blob/3.6/LICENSE
-        host, port = address
-        err = None
-        for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
-            af, socktype, proto, _, sa = res
-            sock = None
-            try:
-                sock = socket.socket(af, socktype, proto)
-                if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-                    sock.settimeout(timeout)
-                if source_address:
-                    sock.bind(source_address)
-                sock.connect(sa)
-                return sock
+    return socket.create_connection(addresses[0], timeout, source_address)
 
-            except socket.error as _:
-                err = _
-                if sock is not None:
-                    sock.close()
 
-        if err is not None:
-            raise err
+def _detect_ipv6():
+    """Detect whether an IPv6 socket can be allocated."""
+    if getattr(socket, "has_ipv6", False) and hasattr(socket, "AF_INET6"):
+        _sock = None
+        try:
+            _sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            _sock.bind(("::1", 0))
+        except OSError:
+            if _sock:
+                _sock.close()
         else:
-            raise socket.error("getaddrinfo returns an empty list")
+            return True
+    return False

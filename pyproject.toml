@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rfc6555"
+version = "0.2.0"
+description = "Python implementation of the Happy Eyeballs Algorithm described in RFC 6555."
+readme = "README.rst"
+requires-python = ">=3.5"
+dependencies = []
+license = { file="LICENSE" }
+authors = [
+  { name="Seth Michael Larson", email="sethmichaellarson@gmail.com" },
+]
+maintainers = [
+  { name="Julien Castiaux", email="julien.castiaux@gmail.com" },
+]
+classifiers = [
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet",
+  "Topic :: System :: Networking",
+]
+
+[tool.ruff]
+line-length = 96  # github editor in split view
+lint.select = ["ALL"]
+lint.ignore = ["ANN", "COM812","SLF001","D203","D212"]
+lint.exclude = ["tests/*"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["rfc6555"]
+
+[tool.tox]
+requires = ["tox"]
+env_list = ["lint", "3.13", "3.12", "3.11", "3.10", "3.9", "3.8", "3.7"]
+
+[tool.tox.env_run_base]
+description = "run unit tests"
+deps = ["pytest"]
+commands = [["pytest", { replace = "posargs", default = ["tests"], extend = true }]]
+
+[tool.tox.env.lint]
+description = "run linters"
+skip_install = true
+deps = ["ruff"]
+commands = [["ruff", { replace = "posargs", default = ["check", "."], extend = true} ]]
