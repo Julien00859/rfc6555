@@ -24,6 +24,7 @@ from selectors import EVENT_WRITE, DefaultSelector
 from time import perf_counter
 
 RFC6555_ENABLED = None  # True: always, False: never, None: if host supports ipv6
+_HAS_IPv6 = None
 
 # These are error numbers for asynchronous operations which can
 # be safely ignored by RFC 6555 as being non-errors.
@@ -250,9 +251,11 @@ class _RFC6555ConnectionManager:
 def create_connection(
     *addresses, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None
 ):
-    global RFC6555_ENABLED  # noqa: PLW0603
+    global RFC6555_ENABLED, _HAS_IPv6  # noqa: PLW0603
     if RFC6555_ENABLED is None:
-        RFC6555_ENABLED = _detect_ipv6()
+        if _HAS_IPv6 is None:
+            _HAS_IPv6 = _detect_ipv6()
+        RFC6555_ENABLED = _HAS_IPv6
     if RFC6555_ENABLED:
         manager = _RFC6555ConnectionManager(
             *addresses,
