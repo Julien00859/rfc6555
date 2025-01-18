@@ -17,9 +17,12 @@
 
 __all__ = ["cache", "create_connection"]
 
+import atexit
+import concurrent.futures
 import contextlib
 import errno
 import socket
+from asyncio.base_event import _ipaddr_info
 from selectors import EVENT_WRITE, DefaultSelector
 from time import perf_counter
 
@@ -60,6 +63,8 @@ class _RFC6555CacheManager:
 
 
 cache = _RFC6555CacheManager()
+thread_pool = concurrent.futures.ThreadPoolExecutor(2, "rfc6555")
+atexit.register(thread_pool.shutdown)
 
 
 class _RFC6555ConnectionManager:
@@ -78,13 +83,8 @@ class _RFC6555ConnectionManager:
     def create_connection(self):
         self._start_time = perf_counter()
 
-        addr_info = [
-            info
-            for host, port in self.addresses
-            for info in socket.getaddrinfo(
-                host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
-            )
-        ]
+        addr_info = self._resolve(self.addresses)
+
         ret = self._connect_with_cached_family(addr_info)
 
         # If it's a list, then these are the remaining values to try.
@@ -110,6 +110,42 @@ class _RFC6555ConnectionManager:
         if self._error:
             raise self._error
         raise TimeoutError
+
+    def _resolve(self, addresses):
+        resolved = []
+        to_resolve = []
+
+        # separate the address already resolved
+        for address in addresses:
+            kw = {"family": socket.AF_UNSPEC, "type": socket.SOCK_STREAM}
+            kw["host"], kw["port"], flowinfo, scopeid, *_ = (*address, 0, 0)
+            if info := _ipaddr_info(**kw, flowinfo=flowinfo, scopeid=scopeid):
+                resolved.append(info)
+            else:
+                to_resolve.append(kw)
+
+        if to_resolve:
+            futures = [thread_pool.submit(socket.getaddrinfo, **kw) for kw in to_resolve]
+            # resolve as many addresses as possible in .2 seconds
+            with contextlib.suppress(TimeoutError):
+                concurrent.futures.wait(
+                    futures,
+                    timeout=self._get_select_time(),
+                    return_when=concurrent.futures.ALL_COMPLETED
+                )
+            if not resolved and not any(f.done() and not f.exception() for f in futures):
+                # no address resolved so far, w
+                with contextlib.suppress(TimeoutError):
+                    concurrent.futures.wait(
+                        futures,
+                        timeout=self._get_remaining_time(),
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+
+            resolved.extend(f.result() for f in futures if f.done() and not f.exception())
+
+        return resolved
+
 
     def _attempt_connect_with_addr_info(self, addr_info):
         sock = None
@@ -210,7 +246,7 @@ class _RFC6555ConnectionManager:
         return None
 
     def _get_remaining_time(self):
-        if self.timeout is None:
+        if self.timeout in (None, socket._GLOBAL_DEFAULT_TIMEOUT):
             return None
         return max(self.timeout - (perf_counter() - self._start_time), 0.0)
 
